@@ -17,14 +17,14 @@ limitations under the License.
 #![warn(clippy::expect_fun_call, clippy::expect_used)]
 
 use std::{
-    collections::HashMap, convert::TryFrom, path::Path, process::exit, str::FromStr, sync::Arc,
-    thread,
+    collections::HashMap, convert::TryFrom, os::fd::AsRawFd, path::Path, process::exit,
+    str::FromStr, sync::Arc,
 };
 
 use containerd_shim::{
     asynchronous::{monitor::monitor_notify_by_pid, util::asyncify},
     error::Error,
-    io_error, other,
+    io_error, other, other_error,
     protos::{shim::shim_ttrpc_async::create_task, ttrpc::asynchronous::Server},
     util::{mkdir, IntoOption},
     Result,
@@ -35,17 +35,15 @@ use log::{debug, error, info, warn, LevelFilter};
 use nix::{
     errno::Errno,
     sched::{unshare, CloneFlags},
-    sys::{
-        wait,
-        wait::{WaitPidFlag, WaitStatus},
-    },
-    unistd::{getpid, gettid, Pid},
+    sys::wait::{self, WaitPidFlag, WaitStatus},
+    unistd::{fork, getpid, pause, pipe, ForkResult, Pid},
 };
 use signal_hook_tokio::Signals;
-use tokio::fs::File;
+use tokio::{fs::File, sync::mpsc::channel};
 use vmm_common::{
     api::sandbox_ttrpc::create_sandbox_service, mount::mount, ETC_RESOLV, HOSTNAME_FILENAME,
-    IPC_NAMESPACE, KUASAR_STATE_DIR, RESOLV_FILENAME, SANDBOX_NS_PATH, UTS_NAMESPACE,
+    IPC_NAMESPACE, KUASAR_STATE_DIR, PID_NAMESPACE, RESOLV_FILENAME, SANDBOX_NS_PATH,
+    UTS_NAMESPACE,
 };
 
 use crate::{
@@ -69,6 +67,8 @@ mod stream;
 mod task;
 mod util;
 mod vsock;
+
+const NAMESPACE: &str = "k8s.io";
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct StaticMount {
@@ -137,10 +137,11 @@ lazy_static! {
     static ref CLONE_FLAG_TABLE: HashMap<String, CloneFlags> = HashMap::from([
         (String::from(IPC_NAMESPACE), CloneFlags::CLONE_NEWIPC),
         (String::from(UTS_NAMESPACE), CloneFlags::CLONE_NEWUTS),
+        (String::from(PID_NAMESPACE), CloneFlags::CLONE_NEWPID),
     ]);
 }
 
-async fn start_task_server() -> anyhow::Result<()> {
+async fn initialize() -> anyhow::Result<()> {
     early_init_call().await?;
 
     let config = TaskConfig::new().await?;
@@ -170,18 +171,28 @@ async fn start_task_server() -> anyhow::Result<()> {
         }
     }
 
-    late_init_call().await?;
-
-    start_ttrpc_server().await?.start().await?;
+    late_init_call(&config).await?;
 
     Ok(())
 }
 
 #[tokio::main]
 async fn main() {
-    // start task server
-    if let Err(e) = start_task_server().await {
-        error!("failed to start task server: {:?}", e);
+    if let Err(e) = initialize().await {
+        error!("failed to do init call: {:?}", e);
+        exit(-1);
+    }
+
+    // Keep server alive in main function
+    let mut server = match create_ttrpc_server().await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("failed to create ttrpc server: {:?}", e);
+            exit(-1);
+        }
+    };
+    if let Err(e) = server.start().await {
+        error!("failed to start ttrpc server: {:?}", e);
         exit(-1);
     }
 
@@ -305,7 +316,7 @@ async fn init_vm_rootfs() -> Result<()> {
 
 // Continue to do initialization that depend on shared path.
 // such as adding guest hook, preparing sandbox files and namespaces.
-async fn late_init_call() -> Result<()> {
+async fn late_init_call(config: &TaskConfig) -> Result<()> {
     // Setup DNS, bind mount to /etc/resolv.conf
     let dns_file = Path::new(KUASAR_STATE_DIR).join(RESOLV_FILENAME);
     if dns_file.exists() {
@@ -321,7 +332,7 @@ async fn late_init_call() -> Result<()> {
     }
 
     // Setup sandbox namespace
-    setup_sandbox_ns().await?;
+    setup_sandbox_ns(config.share_pidns).await?;
 
     Ok(())
 }
@@ -352,13 +363,14 @@ async fn mount_static_mounts(mounts: Vec<StaticMount>) -> Result<()> {
     Ok(())
 }
 
-// start_ttrpc_server will create all the ttrpc service and register them to a server that
+// create_ttrpc_server will create all the ttrpc service and register them to a server that
 // bind to vsock 1024 port.
-async fn start_ttrpc_server() -> anyhow::Result<Server> {
-    let task = create_task_service().await?;
+async fn create_ttrpc_server() -> anyhow::Result<Server> {
+    let (tx, rx) = channel(128);
+    let task = create_task_service(tx).await?;
     let task_service = create_task(Arc::new(Box::new(task)));
 
-    let sandbox = SandboxService::new()?;
+    let sandbox = SandboxService::new(rx)?;
     sandbox.handle_localhost().await?;
     let sandbox_service = create_sandbox_service(Arc::new(Box::new(sandbox)));
 
@@ -368,12 +380,12 @@ async fn start_ttrpc_server() -> anyhow::Result<Server> {
         .register_service(sandbox_service))
 }
 
-async fn setup_sandbox_ns() -> Result<()> {
-    setup_persistent_ns(vec![
-        String::from(IPC_NAMESPACE),
-        String::from(UTS_NAMESPACE),
-    ])
-    .await?;
+async fn setup_sandbox_ns(share_pidns: bool) -> Result<()> {
+    let mut nss = vec![String::from(IPC_NAMESPACE), String::from(UTS_NAMESPACE)];
+    if share_pidns {
+        nss.push(String::from(PID_NAMESPACE));
+    }
+    setup_persistent_ns(nss).await?;
     Ok(())
 }
 
@@ -398,36 +410,69 @@ async fn setup_persistent_ns(ns_types: Vec<String>) -> Result<()> {
             .ok_or(other!("bad ns type {}", ns_type))?;
     }
 
-    let operator = move || -> anyhow::Result<()> {
-        unshare(clone_type)?;
+    fork_sandbox(ns_types, clone_type)?;
 
-        // set hostname
+    Ok(())
+}
+
+fn fork_sandbox(ns_types: Vec<String>, clone_type: CloneFlags) -> Result<()> {
+    debug!("fork sandbox process {:?}, {:b}", ns_types, clone_type);
+    let (r, w) = pipe().map_err(other_error!(e, "create pipe when fork sandbox error"))?;
+    match unsafe { fork().map_err(other_error!(e, "failed to fork"))? } {
+        ForkResult::Parent { child } => {
+            debug!("forked process {} for the sandbox", child);
+            drop(w);
+            let mut resp = [0u8; 4];
+            // just wait the pipe close, do not care the read result
+            nix::unistd::read(r.as_raw_fd(), &mut resp).unwrap_or_default();
+            Ok(())
+        }
+        ForkResult::Child => {
+            drop(r);
+            unshare(clone_type).unwrap();
+            if !ns_types.iter().any(|n| n == PID_NAMESPACE) {
+                debug!("mount namespaces in child");
+                mount_ns(getpid(), &ns_types);
+                exit(0);
+            }
+            // if we need share pid ns, we fork a pause process to act as the pid 1 of the shared pid ns
+            match unsafe { fork().unwrap() } {
+                ForkResult::Parent { child } => {
+                    mount_ns(child, &ns_types);
+                    exit(0);
+                }
+                ForkResult::Child => {
+                    debug!("mount namespaces in grand child");
+                    drop(w);
+                    loop {
+                        pause();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn mount_ns(pid: Pid, ns_types: &Vec<String>) {
+    if ns_types.iter().any(|n| n == UTS_NAMESPACE) {
         let hostname = std::fs::read_to_string(Path::new(KUASAR_STATE_DIR).join(HOSTNAME_FILENAME))
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         if !hostname.is_empty() {
-            nix::unistd::sethostname(hostname)?;
+            debug!("set hostname for sandbox: {}", hostname);
+            nix::unistd::sethostname(hostname).unwrap();
         }
-
-        for ns_type in &ns_types {
-            let sandbox_ns_path = format!("{}/{}", SANDBOX_NS_PATH, ns_type);
-            let ns_path = format!("/proc/{}/task/{}/ns/{}", getpid(), gettid(), ns_type);
-            mount(
-                Some("none"),
-                Some(ns_path.as_str()),
-                &["bind".to_string()],
-                &sandbox_ns_path,
-            )?;
-        }
-        Ok(())
-    };
-
-    thread::spawn(move || {
-        if let Err(e) = operator() {
-            error!("setup persistent ns failed: {:?}", e);
-            exit(-1)
-        }
-    });
-
-    Ok(())
+    }
+    for ns_type in ns_types {
+        let sandbox_ns_path = format!("{}/{}", SANDBOX_NS_PATH, ns_type);
+        let ns_path = format!("/proc/{}/ns/{}", pid, ns_type);
+        debug!("mount {} to {}", ns_path, sandbox_ns_path);
+        mount(
+            Some("none"),
+            Some(ns_path.as_str()),
+            &["bind".to_string()],
+            &sandbox_ns_path,
+        )
+        .unwrap();
+    }
 }

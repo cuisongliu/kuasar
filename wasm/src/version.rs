@@ -1,5 +1,5 @@
 /*
-Copyright 2022 The Kuasar Authors.
+Copyright 2024 The Kuasar Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,12 +13,17 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+pub mod built_info {
+    // The file has been placed there by the build script.
+    include!(concat!(env!("OUT_DIR"), "/built.rs"));
+}
 
-pub mod any;
-pub mod descriptor;
-pub mod empty;
-pub mod events;
-pub mod fieldpath;
-pub mod sandbox;
-pub mod sandbox_ttrpc;
-pub mod timestamp;
+pub fn print_version_info() {
+    if let Some(v) = built_info::GIT_VERSION {
+        match built_info::GIT_DIRTY {
+            Some(true) => println!("Version: {}-dirty", v),
+            _ => println!("Version: {}", v),
+        }
+    }
+    println!("Build Time: {}", built_info::BUILT_TIME_UTC)
+}

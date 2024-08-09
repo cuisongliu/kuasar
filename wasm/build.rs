@@ -1,5 +1,5 @@
 /*
-Copyright 2022 The Kuasar Authors.
+Copyright 2024 The Kuasar Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,12 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use std::process::exit;
 
-pub mod any;
-pub mod descriptor;
-pub mod empty;
-pub mod events;
-pub mod fieldpath;
-pub mod sandbox;
-pub mod sandbox_ttrpc;
-pub mod timestamp;
+fn main() {
+    if let Err(e) = built::write_built_file() {
+        eprint!("Failed to acquire build-time information: {:?}", e);
+        exit(-1)
+    }
+}
